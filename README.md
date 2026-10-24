@@ -36,35 +36,85 @@ As of October 2026 Cloudflare D1's free plan includes up to **5 million rows rea
 
 Never place **FRED_API_KEY, FINNHUB_API_KEY, TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID, DASHBOARD_TOKEN** in GitHub Pages HTML, GitHub repository, or publicly shared messages. Put them in Worker secrets.
 
-## 2. Create Cloudflare D1
+## 2. Connect Cloudflare D1 (required binding: `DB`)
 
-Open a terminal in the **worker** folder:
+**If you already created the database and deployed your Worker, do not create another database.** In your current setup the existing D1 database is named **`risk-monitor-db`**. The database name can vary, but the **Worker binding (variable name) must be exactly `DB`** because the application code calls `env.DB.prepare(...)`.
+
+These are **different** settings:
+
+| Setting | Your current setup | Why it matters |
+|---|---|---|
+| D1 database name | `risk-monitor-db` | The persistent database containing your records |
+| Worker binding / variable name | **`DB`** (case-sensitive) | Makes the database accessible to code as `env.DB` |
+| Previous binding name | `risk_monitor_db` | Does **not** satisfy `env.DB` and caused `Cannot read properties of undefined (reading 'prepare')` |
+
+### Existing deployed Worker: Cloudflare dashboard method
+
+1. Open **Cloudflare Dashboard → Workers & Pages → your Worker → Settings → Bindings → Production** (menu labels can differ).
+2. Select **Add binding → D1 database**.
+3. Set **Variable name / Binding name** to **`DB`** (uppercase).
+4. Select the **existing** database **`risk-monitor-db`**. Do not create a replacement database.
+5. Click **Deploy** to apply the binding.
+6. Once the dashboard connects successfully, you may remove the obsolete `risk_monitor_db` **binding** if it is unused. **Never delete the underlying database** just to remove a binding.
+
+Cloudflare's edit panel may show only the database selector, not an editable binding name. In that case, **add a new `DB` binding** rather than attempting to rename the old one.
+
+### Wrangler configuration (important for future deployments)
+
+If you deploy from a local `worker` project, configure the same binding in `worker/wrangler.jsonc` so future deployments do not overwrite the dashboard configuration. The relevant section should resemble:
+
+```jsonc
+"d1_databases": [
+  {
+    "binding": "DB",
+    "database_name": "risk-monitor-db",
+    "database_id": "YOUR_EXISTING_D1_DATABASE_UUID"
+  }
+]
+```
+
+Use the **actual UUID** shown for `risk-monitor-db` in Cloudflare; do **not** create a new database or substitute the example UUID. If `wrangler.jsonc` contains `"binding": "risk_monitor_db"` or any other name, change **only the binding** to `DB`, while retaining the correct database name and UUID. Keep that change in source control.
+
+For a **brand-new installation only**, from the `worker` folder:
 
 ```bash
 cd worker
 npm install
 npx wrangler login
-npx wrangler d1 create ai-risk-monitor-db
+npx wrangler d1 create risk-monitor-db
 ```
 
-Copy the returned database UUID into `worker/wrangler.jsonc` replacing `REPLACE_WITH_D1_DATABASE_ID`.
+Copy the returned D1 UUID to `worker/wrangler.jsonc`, setting `binding` to `DB` and `database_name` to `risk-monitor-db`. If you've already created `risk-monitor-db`, **skip this creation command**.
 
-**Edit two vars** in `worker/wrangler.jsonc`:
+Set the application variables in `worker/wrangler.jsonc`:
 
 ```json
 "APP_ORIGIN": "https://YOUR-USERNAME.github.io",
-"SEC_USER_AGENT": "AI Risk Monitor Jane Example jane@example.com"
+"SEC_USER_AGENT": "AI Risk Monitor Your Name your-real-email@example.com"
 ```
 
-- `APP_ORIGIN` must be the **origin** of your GitHub Pages URL (no trailing slash or `/REPOSITORY`). If you use a custom domain, supply its origin instead. This prevents other sites from reading your dashboard via a browser (though the private token remains the primary authentication mechanism).
-- Your SEC User-Agent should contain your **actual application name and contact address**. No fictional identity.
-- Optionally edit `SEC_SYMBOLS` for the companies you follow. Supported CIKs are MSFT, AMZN, GOOGL, META, NVDA, AVGO, ORCL, CRWV (at most 10).
+- `APP_ORIGIN` must be the **origin** of your GitHub Pages URL (no trailing slash or `/REPOSITORY`). If you use a custom domain, supply its origin instead. This restricts browser cross-origin access; the private token is still required for authentication.
+- Use your real application/contact identity for `SEC_USER_AGENT`; replace the example.
+- Optionally edit `SEC_SYMBOLS` to follow relevant companies. Supported CIKs are MSFT, AMZN, GOOGL, META, NVDA, AVGO, ORCL, CRWV (at most 10).
 
-Create tables:
+**Apply database migrations** from the `worker` folder **once the Wrangler database configuration points to your existing D1 database**:
 
 ```bash
-npx wrangler d1 migrations apply ai-risk-monitor-db --remote
+npx wrangler d1 migrations apply risk-monitor-db --remote
 ```
+
+This uses your configured database name. If an older package still has `database_name: "ai-risk-monitor-db"`, first update it to your actual name and UUID. Migrations create missing application tables; they are separate from configuring the binding. If your tables are already present and migrations have been recorded, Wrangler skips completed migrations.
+
+**Troubleshooting connection errors**
+
+| Error | Likely cause | Corrective action |
+|---|---|---|
+| `Cannot read properties of undefined (reading 'prepare')` | Missing or misnamed `DB` binding | Add/verify production D1 binding `DB` → `risk-monitor-db`, then deploy; match Wrangler config |
+| `no such table: ...` | D1 is bound, but database schema has not been migrated | Run the migrations command against the **same** existing database |
+| `Unauthorized` / HTTP 401 | Wrong `DASHBOARD_TOKEN` | Ensure HTML token matches your Worker secret; don't post it publicly |
+| Browser CORS / origin error | `APP_ORIGIN` doesn't match the Pages origin | Configure the exact origin, without the repository path |
+
+After configuration, open the GitHub Pages dashboard → **Live monitor**, enter your Worker URL and dashboard token, then **Connect & refresh**. If connecting from the same browser that holds existing local dashboard inputs, follow the on-screen choice to save local data to D1 or load cloud state; avoid overwriting the cloud version unintentionally.
 
 ## 3. Add Worker secrets
 
