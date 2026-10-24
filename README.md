@@ -1,12 +1,12 @@
-# AI Investment Risk Lab — ClearUX edition
+# AI Investment Risk Lab — Clear severity edition (October 2026)
 
 A guided, self-hosted financial-risk research tool. **Static frontend on GitHub Pages, Cloudflare Worker for data checks and Telegram, Cloudflare D1 for saved data.** No trades are placed and numerical thresholds are investigation prompts, not crash forecasts.
 
 ## What changed
 
 - A calm **Home** page explains what to do next, with four collapsible sidebar navigation groups instead of eleven always-visible tabs.
-- **Automated results** now display human-readable conclusions, source dates, *why a rule reached a result*, and *how to interpret it*. No more unexplained `SOURCE: CLEAR` labels. The original machine verdict is preserved when you override it.
-- **Market checklist** still contains all 22 indicators (12 primary, 10 supporting; weekly → monthly → quarterly → event-driven; priority within each). Every item has “what it means / where to find the data / how to assess / example note”. **A manual status is never silently changed because a feed returned data.**
+- **Automated results** now display human-readable conclusions, source dates, *why a rule reached a result*, and *how to interpret it*. No more unexplained `SOURCE: CLEAR` labels. The original calculation and dated source remain visible when you override a checklist result.
+- **Market checklist** still contains all 22 indicators (12 primary, 10 supporting; weekly → monthly → quarterly → event-driven; priority within each). Every item has “what it means / where to find the data / how to assess / example note”. **An automated numerical rating is placed in the checklist field only when a fresh, rule-based assessment is available.** A user-selected rating always takes precedence until you restore automation. Company data-only observations remain **Not assessed**.
 - **Stock reviews** let you select or add a ticker and maintain separate notes and statuses for nine company-specific indicators. Stocks and assessments save inside the existing D1 `user_state` JSON, under `fields.stockReviews`—**no new database tables or migration needed**.
 - **Portfolio stress, position sizing, valuation, moving averages, investment policy and journal** now describe when to use them, what they calculate and what a result means. Existing calculations and controls are preserved.
 - **Telegram** messages now begin with a human-readable category, *why the notification was sent*, evidence, observation date, and what (if anything) you need to do. A new SEC filing is always described as **information, not a risk rating**. User checkbox transitions, including per-stock statuses, are logged and can trigger Telegram messages.
@@ -17,8 +17,8 @@ A guided, self-hosted financial-risk research tool. **Static frontend on GitHub 
 | When | Go to | You will see / do |
 |---|---|---|
 | Starting your routine | **Home** | Connection status, shortcut to results and tools |
-| A Telegram alert arrives | **Monitor → Automated results** | Machine's exact status, source reading and explanation; optionally add an override |
-| Weekly/monthly/quarterly market research | **Review → Market checklist** | Guided, manual 22-indicator overall AI/Nasdaq risk review |
+| A Telegram alert arrives | **Monitor → Automated results** | Machine's exact status, source reading and explanation; use the checklist to override the final severity |
+| Weekly/monthly/quarterly market research | **Review → Market checklist** | 22 guided AI/Nasdaq indicators, 3 with rule-based auto-filled severity; other items require manual judgments |
 | Reviewing NVDA, MSFT or another individual stock | **Review → Stock reviews** | Separate saved per-ticker fundamentals, earnings and valuation notes |
 | An unexpected company/market event happens | **Monitor → Urgent events** | Verify the event, record whether you investigated it |
 | Considering more concentrated exposure | **Plan → Portfolio stress / Position sizing** | Hypothetical portfolio losses and trim-to-target arithmetic |
@@ -29,19 +29,39 @@ A guided, self-hosted financial-risk research tool. **Static frontend on GitHub 
 
 ## What is really automated?
 
-- **Rule-based automatic checks:** Nasdaq-100 index trend (not adjusted QQQM), rapid declines, published VIX level, and widening US high-yield credit spreads. A threshold reaching Watch/Serious means *investigate*, not sell.
+- **Rule-based automatic checks:** Nasdaq-100 index trend (not adjusted QQQM), rapid declines, published VIX level, and widening US high-yield credit spreads. A threshold reaching Moderate/Serious on the **individual rule** means *investigate*, not sell. The Worker retains its internal clear/watch/serious data values; the HTML maps these to Low/Moderate/Serious respectively.
 - **Automatic observations, partial conclusions:** Nasdaq index weekly RSI, 10-year real yield, optional Finnhub quotes, new SEC filings, annual company-wide operating cash flow minus PP&E cash outlays. These are **not** enough to assess AI-specific investment returns or forecast EPS.
-- **Manual / analyst judgment:** Forward EPS consensus revisions, AI capex payback, supplier order quality, genuine company valuation, Nasdaq breadth, sector relative total returns, contracts, tax/liquidity needs, ETF look-through, re-entry plan. The dashboard now explains what to obtain and where.
+- **Manual / analyst judgment:** Forward EPS consensus revisions, AI capex payback, supplier order quality, genuine company valuation, Nasdaq breadth, sector relative total returns, contracts, tax/liquidity needs, ETF look-through, re-entry plan. The dashboard now explains what to obtain and where. A numerical observation is not a completed risk review.
 - Every machine card displays its observation date, rules and source. Missing or stale data are **not** presented as clear.
-- **Manual overrides:** When a source reading exists, open “Disagree with the system?” and select your judgment with a required reason. Underlying machine status and alerting stay separate.
+- **One rating field:** Your market checklist now shows **Not assessed / Low / Moderate / Serious / Very serious**. T1, M1, and S2 can fill the field from fresh rule-based Worker readings. Change that same dropdown to override it. Click **Restore latest automatic rating** to use the current saved Worker result, or **Refresh + restore automatic rating** to ask the Worker for new data first. New data do not overwrite a manual override until you ask. Partial data (e.g., MSFT cash flow) never automatically become Low.
+
+## How to interpret each checklist outcome
+
+**Importance** (Critical/High/Medium/Low) describes how much attention an indicator deserves; it is not its current condition. **Severity** is the actual observed outcome of that indicator:
+
+| Severity | Meaning | Next step |
+|---|---|---|
+| **Not assessed** | No defensible judgment, missing data, unavailable Worker, or data-only measurement | Gather evidence or run the Worker; do not assume Low |
+| **Low** | No warning under this indicator's specific measured rule or manual analysis | Normal scheduled review; not a whole-market all-clear |
+| **Moderate** | Early or limited warning, e.g., credit spread +100 bps from recent low | Check source, persistence and independent signals |
+| **Serious** | Strong threshold or confirmed negative business evidence | Prioritize a deeper review and assess exposure |
+| **Very serious** | Several compelling confirmations / material company threat, typically human-judged | Promptly reassess the thesis and position concentration |
+
+A market indicator's **Low** does not mean the entire market is low risk. This is not an automated crash-probability score or a trading order. Some statuses are informational-only and cannot be promoted to ratings without additional evidence.
+
+**Exactly which outcomes auto-fill?** `T1` Nasdaq-100 index trend, `M1` credit-spread widening, and `S2` VIX stress **at the level of their numerical rules only**. All other checklist items are human-reviewed or receive contextual auto data. A V2 Microsoft cash-flow reading is **Not assessed**, not Low, even if operating cash flow minus PP&E spending is positive.
+
+To override: open **Review → Market checklist**, expand an indicator, change **Risk severity**. Your selection and optional evidence note are saved locally and to D1 when cloud autosync is active. The Worker still collects source measurements and sends machine alert transitions. To revert, use **Restore latest automatic rating**; to re-poll first and replace, use **Refresh + restore automatic rating** (subject to Worker API/rate limits). Those buttons appear **only** where an actual rule-based rating is available. If a Worker observation becomes stale, the screen shows Not assessed; you cannot restore that stale reading until refreshed.
+
+**Stock reviews:** Each ticker uses the same five severity options but currently requires human judgments. Filing notifications and company cash-flow data alone cannot assign a defensible company risk rating. These records remain keyed by ticker in D1 (`fields.stockReviews`).
 
 ## Telegram: when and why
 
 | Message | When sent | How to interpret / what to do |
 |---|---|---|
 | **Daily check-in** | Up to once on weekday market-check days when `CHECKIN_MODE=daily` | A summary of existing checks, not necessarily new bad news. Read observation dates. |
-| **Needs attention / Strong warning** | A supported automatic rule changes to Watch or Serious | Read the measurement, look at other evidence; do not assume an imminent crash. |
-| **Rule returned to normal / Info-only** | A monitored status changes back | Only this one rule improved; the whole market isn't certified safe. |
+| **Moderate / Serious (individual rule)** | A supported automatic rule changes to its underlying watch or serious band | Read the measurement, look at other evidence; do not assume an imminent crash. |
+| **Low (individual rule) / Info-only** | A monitored status changes back | Only this one rule improved; the whole market isn't certified safe. |
 | **New company filing** | Rotating SEC feed identifies a new relevant 8-K/10-Q/10-K | A document appeared. Read it; no good/bad conclusion yet. |
 | **You updated a review / override** | After a D1-synced manual market, urgent or stock checkbox transition, or manual override | Confirms **your action**, not new market data. No notice is sent for routine text typing. |
 | **Telegram test** | You press the Send Telegram test button | Confirms bot delivery. |
@@ -68,7 +88,7 @@ Market FRED checks run at **12:25 UTC weekdays**; optional Finnhub quote polling
 
 1. **Backup first.** From the existing deployed dashboard, export your JSON backup. If connected, also export full cloud history. Keep them outside your public GitHub repo.
 2. **GitHub Pages:** replace your repository's `index.html` with this package's top-level `index.html`. No build step is needed; the HTML is self-contained.
-3. **Worker updates are needed only for the clearer Telegram wording and stock-specific checkbox notifications.** If you want those, update your *existing* Worker with `worker/src/index.js` and ensure the matching `worker/src/rules.js` remains present. If you update only HTML, the old Telegram text remains unchanged.
+3. **Worker update is recommended for the new severity labels in Telegram and proper new-value checkbox audit handling.** If you want those, update your *existing* Worker with `worker/src/index.js` and ensure the matching `worker/src/rules.js` remains present. If you update only HTML, checklist autofill will still work with the existing Worker API, but the old Worker may not send the correct Telegram notice for new severity values.
 4. In `worker/wrangler.jsonc` set:
    - `name` to the **exact existing Worker name** (to update it, not create a new one).
    - `d1_databases[0].binding` to **`DB`** (exact capitalization).

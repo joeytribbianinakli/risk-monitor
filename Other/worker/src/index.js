@@ -4,6 +4,9 @@ const FRED_SERIES={NASDAQ100:'https://fred.stlouisfed.org/series/NASDAQ100',VIXC
 const COMPANIES={MSFT:'0000789019',AMZN:'0001018724',GOOGL:'0001652044',META:'0001326801',NVDA:'0001045810',AVGO:'0001730168',ORCL:'0001341439',CRWV:'0001769628'};
 const ALLOWED_FORMS=new Set(['8-K','8-K/A','10-Q','10-Q/A','10-K','10-K/A','6-K','20-F','20-F/A']);
 const utcNow=()=>new Date().toISOString();
+// Persistent checklist severity is distinct from machine rule status (clear/watch/serious).
+const severityOf=s=>({clear:'low',watch:'moderate',review:'unknown'}[s]||(['unknown','low','moderate','serious','very_serious'].includes(s)?s:'unknown'));
+const severityName=s=>({unknown:'Not assessed',low:'Low',moderate:'Moderate',serious:'Serious',very_serious:'Very serious'}[severityOf(s)]||'Not assessed');
 const J=(data,status=200,headers={})=>new Response(JSON.stringify(data),{status,headers:{'Content-Type':'application/json; charset=utf-8','Cache-Control':'no-store',...headers}});
 const errText=e=>short(e instanceof Error?e.message:String(e),300);
 const urlOf=(req)=>new URL(req.url);
@@ -55,7 +58,7 @@ async function recordCheck(env,check){
  const isChange=!!old && old.status!==payload.status;
  const bootRisk=!old && ['watch','serious'].includes(payload.status);
  if(isChange || bootRisk){
-   const label=payload.status==='clear'?'✅ RULE RETURNED TO NORMAL':payload.status==='serious'?'🔴 STRONG WARNING':payload.status==='watch'?'🟠 NEEDS ATTENTION':'ℹ️ INFO / RULE RESET';
+   const label=payload.status==='clear'?'✅ LOW SEVERITY · THIS RULE':payload.status==='serious'?'🔴 SERIOUS · THIS RULE':payload.status==='watch'?'🟠 MODERATE · THIS RULE':'ℹ️ INFO / RULE RESET';
    const message=`${label}\n\nWhat changed: ${payload.label}\nPrevious: ${old?.status||'first observation'}\nNow: ${payload.status}\n\nWHY you received this:\nThe Worker checked its data feed and this specific rule changed status.\n\nWHAT THE DATA SHOWED:\n${short(payload.reason,750)}\n\nWHAT TO DO:\nOpen Risk Lab → Automated results. Verify the source, compare with other evidence, and decide whether to investigate. This is NOT a buy/sell order and it does not rate the whole AI market.\n\nObservation date: ${payload.asof||'not provided'}\nSource: ${payload.source||'not available'}`;
    await alertEvent(env,'automatic_transition',payload.key,old?.status,payload.status,message,payload.source,true);
  }
@@ -205,7 +208,7 @@ async function sendCheckin(env,summary,mode){
  }
  const checks=(await env.DB.prepare(`SELECT label,status,asof,reason FROM checks WHERE scope IN ('market','quote','system') ORDER BY CASE status WHEN 'serious' THEN 0 WHEN 'watch' THEN 1 WHEN 'review' THEN 2 ELSE 3 END,label LIMIT 30`).all()).results||[];
  const flags=checks.filter(x=>['watch','serious'].includes(x.status));
- const digestFlags=flags.slice(0,4).map(x=>`• ${x.label} — ${x.status==='serious'?'STRONG WARNING':'NEEDS ATTENTION'} (data ${x.asof||'undated'})\n  ${short(x.reason,170)}`);
+ const digestFlags=flags.slice(0,4).map(x=>`• ${x.label} — ${x.status==='serious'?'SERIOUS':'MODERATE'} (data ${x.asof||'undated'})\n  ${short(x.reason,170)}`);
  const readable=flags.length?`Items needing review (${flags.length} among fetched checks):\n${digestFlags.join('\n')}`:'No Watch/Serious flags in the fetched summary. This does NOT prove the whole market is safe.';
  const msg=`📋 RISK LAB — ${mode==='daily'?'DAILY CHECK-IN':'CHECK SUMMARY'}\n\nWHY this message: ${mode==='daily'?'Your scheduled daily summary is enabled. This is not necessarily a new warning.':'Your Worker completed a check with status changes.'}\n\nWHAT WAS CHECKED:\n• ${summary.checked} data checks completed\n• ${summary.changed} status changes detected\n• ${summary.errors.length} provider problems\n\n${readable}\n${summary.errors.length?'\nData access problems: '+summary.errors.slice(0,2).map(x=>short(x,130)).join('; '):''}\n\nHOW TO USE THIS: Open Risk Lab → Automated results to see dated evidence. "No warning" only applies to rules checked successfully. The system does not trade for you.\n\nRun time: ${utcNow()} UTC (observation dates may be earlier).`;
  try{await telegram(env,msg)}catch(e){console.error('check-in telegram failed',errText(e));}
@@ -263,15 +266,33 @@ async function saveUserState(req,env){
  if(!result.meta?.changes)return J({error:'Concurrent update; load cloud version and retry'},409);
  // Sync manual checkbox changes; no alert on initial import, avoids 22 false events.
  if(old){
-  for(const [scope,field,valid] of [['checklist','signals',['unknown','clear','watch','serious']],['urgent','alerts',['unknown','clear','investigating','confirmed']]]){
+  for(const [scope,field,valid] of [['checklist','signals',['unknown','clear','watch','serious','low','moderate','very_serious']],['urgent','alerts',['unknown','clear','investigating','confirmed']]]){
    const keys=new Set([...Object.keys(state[field]),...Object.keys(previous[field]||{})]);
    for(const key of keys){
     if(!/^[A-Z]\d{1,2}$/.test(key))continue;
-    const prior=previous[field]?.[key]?.status||'unknown',current=state[field]?.[key]?.status||'unknown';
-    if(!valid.includes(current)||prior===current)continue;
-    const word=current==='clear'?'✅ NO WARNING MARKED':current==='unknown'?'⚪ REVIEW RESET':current==='serious'||current==='confirmed'?'🔴 STRONG WARNING MARKED':'🟠 NEEDS ATTENTION MARKED';
-    const note=short(state[field]?.[key]?.evidence||state[field]?.[key]?.note||'No evidence note supplied.',480);
-    const msg=`📝 YOU UPDATED A REVIEW\n\n${word}\nItem: ${scope==='checklist'?'Market checklist':'Urgent event'} ${key}\nYou changed: ${prior} → ${current}\n\nWHY notified: You changed this check in Risk Lab. This is YOUR assessment, not a new automated market signal.\n\nYour evidence: ${note}\n\nWHAT TO DO: Nothing required unless you want to review your note or affected holdings. The change is stored in D1.`;
+    const before=previous[field]?.[key]||{},after=state[field]?.[key]||{};
+    const prior=before.status||'unknown',current=after.status||'unknown';
+    if(!valid.includes(current))continue;
+    // Old clear/watch checklist statuses are semantically identical to Low/Moderate.
+    if((scope==='checklist'?severityOf(prior)===severityOf(current):prior===current))continue;
+    // New machine observations already have separate source-change events; do not mislabel these as manual checkbox edits.
+    if(scope==='checklist'&&after.origin==='auto'&&before.origin!=='manual')continue;
+    const word=scope==='checklist'?severityName(current):current;
+    const note=short(after.evidence||after.note||'No evidence note supplied.',480);
+    const autoRestore=scope==='checklist'&&after.origin==='auto';
+    const msg=`📝 ${autoRestore?'AUTOMATIC RATING RESTORED':'YOU UPDATED A RISK REVIEW'}
+
+Item: ${scope==='checklist'?'Market checklist':'Urgent event'} ${key}
+Previous: ${scope==='checklist'?severityName(prior):prior}
+New: ${word}
+
+WHY notified: ${autoRestore?'You pressed “Use latest automatic assessment” in your checklist.':'You changed the saved assessment yourself.'}
+
+WHAT IT MEANS: ${scope==='checklist'?'This severity describes only this indicator, not the probability of an AI-market crash.':'This is an urgent-event review, not an automatic sell order.'}
+
+Your evidence: ${note}
+
+NEXT: Review affected holdings if the new information is material. No trade is placed.`;
     await alertEvent(env,'manual_checkbox',`${scope}:${key}`,prior,current,msg,null,true);
    }
   }
@@ -284,8 +305,19 @@ async function saveUserState(req,env){
       if(!/^[A-Z][0-9]{1,2}$/.test(indicatorId))continue;
       const prior=stockBefore?.[sym]?.review?.[indicatorId]?.status||'unknown';
       const nowStatus=entry?.status||'unknown';
-      if(prior===nowStatus||!['unknown','clear','watch','serious'].includes(nowStatus))continue;
-      const msg=`📝 YOU UPDATED A STOCK REVIEW\n\nStock: ${sym}\nIndicator: ${indicatorId}\nChanged: ${prior} → ${nowStatus}\n\nWHY notified: You manually checked or cleared a company-specific item. This is not a live SEC risk rating.\n\nYour evidence: ${short(entry?.note||'No note provided.',480)}\n\nWHAT TO DO: Open Risk Lab → Stock reviews → ${sym} if you want to revisit the decision. The ticker and note are saved in D1.`;
+      if(severityOf(prior)===severityOf(nowStatus)||!['unknown','clear','watch','serious','low','moderate','very_serious'].includes(nowStatus))continue;
+      const msg=`📝 YOU UPDATED A STOCK RISK REVIEW
+
+Stock: ${sym}
+Indicator: ${indicatorId}
+Previous: ${severityName(prior)}
+New: ${severityName(nowStatus)}
+
+WHY notified: You changed your severity rating for this stock. SEC cash-flow data or new filings do not automatically mean low risk.
+
+Your evidence: ${short(entry?.note||'No note provided.',480)}
+
+NEXT: Review ${sym} in Risk Lab → Stock reviews if this changes your thesis. The rating and ticker are saved to D1.`;
       await alertEvent(env,'manual_stock_review',`stock:${sym}:${indicatorId}`,prior,nowStatus,msg,null,true);
     }
   }

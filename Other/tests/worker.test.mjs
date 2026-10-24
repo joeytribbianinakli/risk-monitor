@@ -91,3 +91,22 @@ test('per-ticker stock reviews persist in existing D1 user_state and checkbox ch
  assert.match(history.body.events[0].message,/NVDA/);
  assert.match(history.body.events[0].message,/Consensus EPS/);
 });
+test('new severity scale persists in D1 and auto-fill is not mislabeled as a human checkbox',async()=>{
+ const env=freshEnv();
+ const source={fields:{stockReviews:{MSFT:{review:{V2:{status:'moderate',note:'Cash flow requires multi-year review'}}}}},signals:{T1:{status:'low',origin:'auto',autoAsOf:'2026-10-24'},M1:{status:'very_serious',origin:'manual',evidence:'Credit and loan losses are materially worsening'}},alerts:{},journal:[]};
+ let x=await api(env,'/api/user-state',{method:'PUT',body:{revision:0,state:source}});assert.equal(x.status,200);
+ x=await api(env,'/api/user-state');assert.equal(x.body.state.signals.M1.status,'very_serious');assert.equal(x.body.state.signals.T1.origin,'auto');
+ const y=structuredClone(source);y.signals.M1={...y.signals.M1,status:'moderate'};y.signals.T1={...y.signals.T1,status:'serious'};
+ x=await api(env,'/api/user-state',{method:'PUT',body:{revision:1,state:y}});assert.equal(x.status,200);
+ const events=(await api(env,'/api/overview')).body.events;
+ assert.equal(events.filter(e=>e.kind==='manual_checkbox').length,1);
+ assert.match(events.find(e=>e.kind==='manual_checkbox').message,/Moderate/);
+});
+test('legacy clear to low and watch to moderate migration does not send false alerts',async()=>{
+ const env=freshEnv();
+ const old={fields:{},signals:{T1:{status:'clear'},M1:{status:'watch'}},alerts:{},journal:[]};
+ let r=await api(env,'/api/user-state',{method:'PUT',body:{revision:0,state:old}});assert.equal(r.status,200);
+ const current={...old,signals:{T1:{status:'low',origin:'manual'},M1:{status:'moderate',origin:'manual'}}};
+ r=await api(env,'/api/user-state',{method:'PUT',body:{revision:1,state:current}});assert.equal(r.status,200);
+ assert.equal((await api(env,'/api/overview')).body.events.length,0);
+});
