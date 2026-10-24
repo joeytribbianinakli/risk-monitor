@@ -1,4 +1,208 @@
-import {evaluateNasdaq,evaluateShock,evaluateVix,evaluateCredit,evaluateRealYield,evaluateWeeklyRsi,parseFred,normaliseCheckStatus,short} from './rules.js';
+// AI Risk Lab · SINGLE-FILE Cloudflare Worker · Copy ALL this text into Cloudflare → Edit code.
+// Existing Worker name, D1 binding DB, DASHBOARD_TOKEN and APP_ORIGIN stay unchanged.
+// Cloudflare D1 stores encrypted dashboard-managed keys and alert configuration (no extra schema).
+
+// Pure rules, intentionally isolated for offline tests. Percent values are percentage points.
+const STATUS = ['unknown', 'clear', 'watch', 'serious', 'review'];
+const isoDay = (s) => String(s ?? '').slice(0, 10);
+function sma(data, days) {
+  if (!Array.isArray(data) || data.length < days) return null;
+  const sample = data.slice(-days);
+  return sample.reduce((sum, entry) => sum + entry.value, 0) / days;
+}
+function percentChange(current, base) {
+  return Number.isFinite(current) && Number.isFinite(base) && base > 0
+    ? (current / base - 1) * 100 : null;
+}
+function latestAtLeast(data, days) {
+  if (!data?.length) return null;
+  const end = new Date(`${data.at(-1).date}T00:00:00Z`).getTime();
+  const target = end - days * 86400e3;
+  for (let i = data.length - 2; i >= 0; i--) {
+    if (Date.parse(data[i].date + 'T00:00:00Z') <= target) return data[i];
+  }
+  return null;
+}
+function evaluateNasdaq(data) {
+  if (!data || data.length < 200) return {status:'unknown', reason:'Fewer than 200 trading-session observations', value:null};
+  const last = data.at(-1), m50=sma(data,50),m200=sma(data,200),old200=data.length >= 220 ? sma(data.slice(0,-20),200) : null;
+  const dist50=percentChange(last.value,m50),dist200=percentChange(last.value,m200);
+  const p5=data.length>5?percentChange(last.value,data.at(-6).value):null;
+  const p20=data.length>20?percentChange(last.value,data.at(-21).value):null;
+  // 200D is slow and not a complete sell signal. Serious demands confirming 50D weakness.
+  let status='clear';
+  if(last.value < m200 && last.value < m50 && (old200 === null || m200 < old200)) status='serious';
+  else if(last.value < m50 || last.value < m200) status='watch';
+  return {status, asof:last.date, value:+dist200.toFixed(2),
+    reason:`${status==='serious'?'SERIOUS: The Nasdaq-100 finished BELOW both its 50-day and 200-day averages, with the long-term average falling or insufficient slope history.':status==='watch'?'MODERATE: The Nasdaq-100 is BELOW at least one of its 50-day or 200-day averages. This is weakening price momentum, not a proven crash.':'LOW for this price-trend rule: The Nasdaq-100 is ABOVE both its 50-day and 200-day averages.'} Latest index close: ${last.value.toFixed(1)}. It is ${Math.abs(dist50).toFixed(1)}% ${dist50<0?'BELOW':'ABOVE'} its 50-day average (${m50.toFixed(1)}) and ${Math.abs(dist200).toFixed(1)}% ${dist200<0?'BELOW':'ABOVE'} its 200-day average (${m200.toFixed(1)}). Over the last 5 trading sessions: ${p5?.toFixed(1)??'n/a'}%; last 20: ${p20?.toFixed(1)??'n/a'}%. Rule: below either average = Moderate; below both with falling 200-day average = Serious. This is a Nasdaq-100 INDEX proxy, not QQQM or a forecast.`,
+    metrics:{index:last.value,sma50:m50,sma200:m200,pctSma50:dist50,pctSma200:dist200,change5:p5,change20:p20}};
+}
+function evaluateShock(data) {
+  if (!data || data.length < 22) return {status:'unknown',reason:'Need 22 daily observations',value:null};
+  const last=data.at(-1),p5=percentChange(last.value,data.at(-6).value),p20=percentChange(last.value,data.at(-21).value);
+  // Heuristics explicitly labeled, prompt investigation not trades.
+  const status = p5 <= -10 + 1e-8 || p20 <= -20 + 1e-8 ? 'serious' : p5 <= -6 + 1e-8 || p20 <= -12 + 1e-8 ? 'watch' : 'clear';
+  return {status,asof:last.date,value:+p5.toFixed(2),reason:`${status==='serious'?'SERIOUS rapid-decline rule triggered.':status==='watch'?'MODERATE rapid-decline rule triggered.':'LOW for this rapid-decline rule; no loss threshold crossed.'} Nasdaq-100 changed ${p5.toFixed(2)}% over 5 trading sessions and ${p20.toFixed(2)}% over 20 sessions. Moderate if 5-day loss reaches 6% or 20-day loss reaches 12%; Serious if 5-day loss reaches 10% or 20-day loss reaches 20%. A decline itself does not predict future direction.`,metrics:{change5:p5,change20:p20}};
+}
+function evaluateVix(data) {
+  if (!data?.length) return {status:'unknown',reason:'No published VIX observation',value:null};
+  const latest=data.at(-1);
+  return {status:latest.value>=35?'serious':latest.value>=25?'watch':'clear',asof:latest.date,
+    value:latest.value,reason:`${latest.value>=35?'SERIOUS:':latest.value>=25?'MODERATE:':'LOW for this volatility threshold:'} Latest published VIX is ${latest.value.toFixed(2)}. This rule flags Moderate at VIX 25 or above and Serious at 35 or above. VIX reflects expected near-term S&P 500 volatility, not the probability of a crash, and can jump after prices fall.`};
+}
+function evaluateCredit(data) {
+  if (!data?.length) return {status:'unknown',reason:'No credit spread observations',value:null};
+  const last=data.at(-1),window=data.filter(x=>Date.parse(x.date)>=Date.parse(last.date)-183*86400e3);
+  if(window.length < 20) return {status:'unknown',reason:'Insufficient data for 6-month spread low',value:null};
+  const low=Math.min(...window.map(x=>x.value)),riseBps=Math.round((last.value-low)*100);
+  return {status:riseBps>=200?'serious':riseBps>=100?'watch':'clear',asof:last.date,value:riseBps,
+    reason:`${riseBps>=200?'SERIOUS: Credit spreads widened at least 200 basis points from their six-month low.':riseBps>=100?'MODERATE: Credit spreads widened at least 100 basis points from their six-month low.':'LOW for this spread-widening rule: the 100-basis-point alert threshold was not crossed.'} Latest US high-yield option-adjusted spread is ${last.value.toFixed(2)} percentage points; its six-month low was ${low.toFixed(2)} points. Difference = ${riseBps} basis points (100 basis points = 1 percentage point). Credit spreads rising can signal greater perceived default risk; this is not a market crash forecast.`,metrics:{spread:last.value,low,riseBps}};
+}
+function evaluateRealYield(data) {
+  if (!data?.length) return {status:'unknown',reason:'Real-yield series not available',value:null};
+  const last=data.at(-1);
+  return {status:'review',asof:last.date,value:last.value,reason:`10-year TIPS real yield ${last.value.toFixed(2)}%; context only; no risk status can be concluded from yields alone.`};
+}
+function parseFred(json) {
+  if (!Array.isArray(json?.observations)) throw new Error('FRED observations missing');
+  return json.observations.filter(x=>x.value!=='.' && Number.isFinite(Number(x.value)))
+   .map(x=>({date:x.date,value:Number(x.value)})).sort((a,b)=>a.date.localeCompare(b.date));
+}
+function normaliseCheckStatus(s) { return STATUS.includes(s) ? s : 'unknown'; }
+function short(s,n=340){return String(s??'').slice(0,n)}
+
+// Weekly RSI from the latest available close in each UTC Monday-to-Sunday market week.
+// It is the NASDAQ-100 index, NOT an adjusted QQQM ETF weekly RSI.
+function evaluateWeeklyRsi(data) {
+ if (!data?.length) return {status:'unknown',reason:'No daily index history for weekly RSI'};
+ const byWeek=new Map();
+ for(const x of data){
+  const d=new Date(x.date+'T00:00:00Z');
+  if(!Number.isFinite(+d))continue;
+  const monday=new Date(+d-((d.getUTCDay()+6)%7)*86400e3).toISOString().slice(0,10);
+  // Source is sorted by date; the last dated close within each week wins.
+  byWeek.set(monday,x);
+ }
+ const bars=[...byWeek.values()];
+ if(bars.length<16)return {status:'unknown',reason:'Need at least 16 weekly closing observations'};
+ let gain=0,loss=0;
+ for(let i=1;i<=14;i++){
+  const diff=bars[i].value-bars[i-1].value;
+  gain+=Math.max(0,diff);loss+=Math.max(0,-diff);
+ }
+ gain/=14;loss/=14;
+ for(let i=15;i<bars.length;i++){
+  const diff=bars[i].value-bars[i-1].value;
+  gain=(gain*13+Math.max(0,diff))/14;
+  loss=(loss*13+Math.max(0,-diff))/14;
+ }
+ const rsi=loss===0?(gain===0?50:100):100-100/(1+gain/loss);
+ const last=bars.at(-1);
+ return {status:'review',value:+rsi.toFixed(2),asof:last.date,
+  reason:`NASDAQ-100 14-week RSI ${rsi.toFixed(1)} from weekly index closing observations (not adjusted QQQM data). ${rsi>70?'High momentum can persist;':rsi<30?'Low momentum can persist;':'Midrange momentum;'} RSI alone does not establish bearish divergence or justify a sale. Review price/RSI peaks manually.`,
+  metrics:{rsi14:rsi,weeklyBars:bars.length,indexClose:last.value}};
+}
+
+
+// Alert Center configuration and encrypted, optional browser-managed provider credentials.
+// Stored using existing D1 cursors table. DASHBOARD_TOKEN must remain a Cloudflare Worker secret.
+const AC_SETTINGS_KEY='ui:alert-settings:v1';
+const AC_KEYS_KEY='ui:encrypted-credentials:v1';
+const AC_KEY_FIELDS=['FRED_API_KEY','FINNHUB_API_KEY','TELEGRAM_BOT_TOKEN','TELEGRAM_CHAT_ID','SEC_USER_AGENT','SEC_SYMBOLS'];
+const AC_NAMES={automatic_transition:'Automated market warning changed',new_filing:'New SEC filing',manual_checkbox:'Market checklist rating changed',manual_stock_review:'Stock review rating changed',manual_override:'Legacy override changed',digest:'Scheduled summary',custom_rule:'My custom rule',provider_health:'Data source problem'};
+const AC_DEFAULT_TEMPLATES={
+ automatic_transition:'🔔 {title}\nRating: {previous} → {severity}\nWhy: {reason}\nData date: {date}\nSource: {source}\n\nReview the relevant checklist item. This does not place a trade.',
+ new_filing:'📄 {title}\nDetected: {date}\nWhy: {reason}\nSource: {source}\n\nNew filing = new information, not necessarily bad news.',
+ manual_checkbox:'📝 {title}\nYour selection: {previous} → {severity}\nEvidence: {reason}\n\nYour manual rating was saved. No trade is placed.',
+ manual_stock_review:'📝 {ticker} stock review changed\nRating: {previous} → {severity}\nReason: {reason}\n\nOpen Stock reviews to revisit it.',
+ manual_override:'✍️ {title}\nRating: {previous} → {severity}\nReason: {reason}',
+ digest:'📋 Risk Lab scheduled summary\n{reason}\nChecked: {checked}\nChanged: {changed}\nErrors: {errors}\n\nThis is a recap, not necessarily a new warning.',
+ custom_rule:'🎯 MY ALERT: {title}\nCurrent result: {severity}\nEarlier: {previous}\nWhy this triggered: {reason}\nDate: {date}\nSource: {source}',
+ provider_health:'⚠️ {title}\n{reason}\nDate: {date}'
+};
+const AC_DEFAULTS=()=>({enabled:Object.fromEntries(Object.keys(AC_NAMES).map(k=>[k,true])),digestMode:'daily',templates:{...AC_DEFAULT_TEMPLATES},rules:[]});
+const acSafe=(x,n=1500)=>String(x??'').slice(0,n);
+const acIsPlain=o=>o&&typeof o==='object'&&!Array.isArray(o);
+async function acReadDb(env,key){return (await env.DB.prepare('SELECT value FROM cursors WHERE key=?').bind(key).first())?.value??null;}
+async function acWriteDb(env,key,value){await env.DB.prepare('INSERT INTO cursors(key,value,updated_at) VALUES(?,?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value,updated_at=excluded.updated_at').bind(key,value,new Date().toISOString()).run();}
+function acNormalize(input){
+ const d=AC_DEFAULTS();if(!acIsPlain(input))return d;
+ for(const k of Object.keys(d.enabled))if(typeof input.enabled?.[k]==='boolean')d.enabled[k]=input.enabled[k];
+ if(['daily','changes','always','off'].includes(input.digestMode))d.digestMode=input.digestMode;
+ for(const k of Object.keys(d.templates))if(typeof input.templates?.[k]==='string')d.templates[k]=acSafe(input.templates[k],1800);
+ const validSev=['low','moderate','serious','very_serious'];
+ if(Array.isArray(input.rules)){
+  d.rules=input.rules.slice(0,25).filter(r=>acIsPlain(r)).map(r=>({
+    id:/^[a-zA-Z0-9_-]{4,60}$/.test(r.id)?r.id:`rule_${crypto.randomUUID().slice(0,16)}`,
+    name:acSafe(r.name||'My alert',90),enabled:r.enabled!==false,
+    kind:r.kind==='numeric'?'numeric':'severity',
+    source:['automatic','manual','both'].includes(r.source)?r.source:'automatic',
+    key:r.key==='*'?'*':/^[A-Za-z0-9:._-]{1,45}$/.test(r.key||'')?r.key:'*',
+    trigger:['enters_at_or_above','enters_exact','any_change'].includes(r.trigger)?r.trigger:'enters_at_or_above',
+    severity:validSev.includes(r.severity)?r.severity:'serious',
+    op:r.op==='<'?'<':'>=',threshold:Number.isFinite(Number(r.threshold))?Math.max(-10000,Math.min(10000,Number(r.threshold))):0,
+    metric:/^[A-Za-z][A-Za-z0-9]{0,30}$/.test(r.metric||'')?r.metric:'value',
+    template:acSafe(r.template||'',1200)
+  }));
+ }
+ return d;
+}
+async function acGetSettings(env){const raw=await acReadDb(env,AC_SETTINGS_KEY);if(!raw)return AC_DEFAULTS();try{return acNormalize(JSON.parse(raw))}catch{return AC_DEFAULTS()}}
+async function acSaveSettings(env,body){if(!acIsPlain(body))throw Error('Invalid alert configuration');const s=acNormalize(body);await acWriteDb(env,AC_SETTINGS_KEY,JSON.stringify(s));return s;}
+// Derive an AES-256-GCM key from the existing high-entropy dashboard secret; random IV per update.
+// Keep Dashboard Token safe. Rotating it invalidates D1-encrypted keys until re-entered.
+async function acCryptoKey(env){if(!env.DASHBOARD_TOKEN||env.DASHBOARD_TOKEN.length<24)throw Error('DASHBOARD_TOKEN must be a long Cloudflare secret');const key=await crypto.subtle.digest('SHA-256',new TextEncoder().encode('ai-risk-lab-d1-credentials-v1/'+env.DASHBOARD_TOKEN));return crypto.subtle.importKey('raw',key,{name:'AES-GCM'},false,['encrypt','decrypt']);}
+const acB64=bytes=>btoa(Array.from(bytes,b=>String.fromCharCode(b)).join(''));
+const acUn64=s=>Uint8Array.from(atob(s),c=>c.charCodeAt(0));
+async function acEncrypt(env,plain){const iv=crypto.getRandomValues(new Uint8Array(12)),key=await acCryptoKey(env);const cipher=new Uint8Array(await crypto.subtle.encrypt({name:'AES-GCM',iv},key,new TextEncoder().encode(JSON.stringify(plain))));return JSON.stringify({v:1,iv:acB64(iv),ct:acB64(cipher)});}
+async function acDecrypt(env,raw){if(!raw)return {};try{const v=JSON.parse(raw);if(v.v!==1)throw Error('Unsupported version');const key=await acCryptoKey(env);const clear=await crypto.subtle.decrypt({name:'AES-GCM',iv:acUn64(v.iv)},key,acUn64(v.ct));const obj=JSON.parse(new TextDecoder().decode(clear));if(!acIsPlain(obj))throw Error('Bad credentials format');return obj;}catch{throw Error('Cannot decrypt saved API keys. If you changed DASHBOARD_TOKEN, re-enter provider keys in the dashboard.')}}
+async function acGetKeys(env){return acDecrypt(env,await acReadDb(env,AC_KEYS_KEY));}
+async function acUpdateKeys(env,body){
+ if(!acIsPlain(body))throw Error('Invalid credentials request');const existing=body.reset===true?{}:await acGetKeys(env);
+ const update=acIsPlain(body.values)?body.values:{};
+ for(const k of AC_KEY_FIELDS)if(Object.prototype.hasOwnProperty.call(update,k)){
+  const v=String(update[k]??'').trim();if(v.length>2000)throw Error(`${k} exceeds size limit`);
+  if(v)existing[k]=v; // empty means unchanged; use remove for intentional deletion
+ }
+ for(const k of Array.isArray(body.remove)?body.remove:[])if(AC_KEY_FIELDS.includes(k))delete existing[k];
+ await acWriteDb(env,AC_KEYS_KEY,await acEncrypt(env,existing));
+ return acKeyMeta(env,existing);
+}
+function acKeyMeta(env,saved){return Object.fromEntries(AC_KEY_FIELDS.map(k=>[k,{stored:!!saved[k],legacy:!!env[k],canReveal:!!saved[k],label:saved[k]?'Saved securely in D1 (View/Copy available)':env[k]?'Cloudflare secret in use (cannot be revealed here)':'Not configured'}]));}
+async function acEffectiveEnv(env){const [secrets,settings]=await Promise.all([acGetKeys(env),acGetSettings(env)]);return Object.assign({},env,secrets,{__acSettings:settings});}
+function acApplyTemplate(template,data){
+ const value={...data};
+ return acSafe(String(template).replace(/\{(title|ticker|previous|severity|reason|date|source|checked|changed|errors|key|value)\}/g,(all,key)=>acSafe(value[key]??'—',850)),3900);
+}
+function acShouldNotify(settings,category){return settings.enabled[category]!==false;}
+const acOrder={unknown:-1,review:-1,clear:0,low:0,watch:1,moderate:1,serious:2,very_serious:3};
+function acSeverity(status){return ({clear:'low',watch:'moderate',review:'unknown'}[status]||status||'unknown');}
+const acFriendly=status=>({unknown:'Not assessed',low:'Low',moderate:'Moderate',serious:'Serious',very_serious:'Very serious'}[acSeverity(status)]||'Not assessed');
+async function acFireCustomRules(env,ob,emit){
+ const s=env.__acSettings||await acGetSettings(env);if(!acShouldNotify(s,'custom_rule'))return;
+ for(const r of s.rules){
+  if(!r.enabled || (r.source!=='both'&&r.source!==ob.source)|| (r.key!=='*'&&r.key!==ob.key))continue;
+  let triggered=false,detail='';
+  if(r.kind==='numeric'){
+   if(ob.source!=='automatic')continue;
+   const n=r.metric==='value'?Number(ob.value):Number(ob.metrics?.[r.metric]);if(!Number.isFinite(n))continue;
+   const hit=r.op==='<'?n<r.threshold:n>=r.threshold;
+   const ck=`ui:rule-tripped:${r.id}:${ob.key}`,before=await acReadDb(env,ck);await acWriteDb(env,ck,hit?'1':'0');
+   triggered=hit&&before!=='1';detail=`${r.metric} = ${Number(n.toFixed(3))}; trigger ${r.op} ${r.threshold}. ${ob.reason||''}`;
+  } else {
+   if(ob.oldStatus===ob.newStatus)continue;
+   const newVal=acOrder[acSeverity(ob.newStatus)]??-1,oldVal=acOrder[acSeverity(ob.oldStatus)]??-1,t=acOrder[r.severity];
+   triggered=r.trigger==='any_change'||(r.trigger==='enters_exact' ? newVal===t&&oldVal!==t:newVal>=t&&oldVal<t);
+   detail=`Rule: ${r.trigger.replaceAll('_',' ')} ${r.severity.replace('_',' ')}. ${ob.reason||''}`;
+  }
+  if(!triggered)continue;
+  const data={title:r.name,key:ob.key,ticker:ob.ticker||'',previous:acFriendly(ob.oldStatus),severity:acFriendly(ob.newStatus),date:ob.asof||new Date().toISOString().slice(0,10),reason:detail,source:ob.sourceUrl||'',value:ob.value??''};
+  const msg=acApplyTemplate(r.template||s.templates.custom_rule,data);
+  await emit(env,'custom_rule',`user_rule:${r.id}:${ob.key}`,ob.oldStatus||null,ob.newStatus||null,msg,ob.sourceUrl||null,true,{templateOverride:msg,title:r.name,...data});
+ }
+}
+
+
 
 const FRED_SERIES={NASDAQ100:'https://fred.stlouisfed.org/series/NASDAQ100',VIXCLS:'https://fred.stlouisfed.org/series/VIXCLS',BAMLH0A0HYM2:'https://fred.stlouisfed.org/series/BAMLH0A0HYM2',DFII10:'https://fred.stlouisfed.org/series/DFII10'};
 const COMPANIES={MSFT:'0000789019',AMZN:'0001018724',GOOGL:'0001652044',META:'0001326801',NVDA:'0001045810',AVGO:'0001730168',ORCL:'0001341439',CRWV:'0001769628'};
@@ -39,10 +243,15 @@ async function insertEvent(env,kind,key,oldStatus,newStatus,message,sourceUrl){
   .bind(utcNow(),kind,key,oldStatus??null,newStatus??null,short(message,1800),sourceUrl||null).run();
  return res.meta?.last_row_id??null;
 }
-async function alertEvent(env,kind,key,oldS,newS,message,sourceUrl,send=true){
+async function alertEvent(env,kind,key,oldS,newS,message,sourceUrl,send=true,meta={}){
+ const settings=env.__acSettings||await acGetSettings(env);
+ const title=meta.title||meta.label||key;
+ const context={title,previous:acFriendly(oldS),severity:acFriendly(newS),reason:meta.reason||message,date:meta.date||utcNow().slice(0,10),source:sourceUrl||'',ticker:meta.ticker||'',key,value:meta.value??'',checked:meta.checked??'',changed:meta.changed??'',errors:meta.errors??''};
+ // Existing evidence/audit text is retained in D1. Notification template affects Telegram only.
  const id=await insertEvent(env,kind,key,oldS,newS,message,sourceUrl);
- if(send && id){
-   try{const v=await telegram(env,message);if(v.sent)await env.DB.prepare('UPDATE events SET notified=1 WHERE id=?').bind(id).run();}
+ if(send && id && acShouldNotify(settings,kind)){
+   const chosen=meta.templateOverride||acApplyTemplate(settings.templates[kind]||'{reason}',context);
+   try{const v=await telegram(env,chosen);if(v.sent)await env.DB.prepare('UPDATE events SET notified=1 WHERE id=?').bind(id).run();}
    catch(e){console.error('Telegram delivery failed',errText(e));}
  }
  return id;
@@ -60,8 +269,9 @@ async function recordCheck(env,check){
  if(isChange || bootRisk){
    const label=payload.status==='clear'?'✅ LOW SEVERITY · THIS RULE':payload.status==='serious'?'🔴 SERIOUS · THIS RULE':payload.status==='watch'?'🟠 MODERATE · THIS RULE':'ℹ️ INFO / RULE RESET';
    const message=`${label}\n\nWhat changed: ${payload.label}\nPrevious: ${old?.status||'first observation'}\nNow: ${payload.status}\n\nWHY you received this:\nThe Worker checked its data feed and this specific rule changed status.\n\nWHAT THE DATA SHOWED:\n${short(payload.reason,750)}\n\nWHAT TO DO:\nOpen Risk Lab → Automated results. Verify the source, compare with other evidence, and decide whether to investigate. This is NOT a buy/sell order and it does not rate the whole AI market.\n\nObservation date: ${payload.asof||'not provided'}\nSource: ${payload.source||'not available'}`;
-   await alertEvent(env,'automatic_transition',payload.key,old?.status,payload.status,message,payload.source,true);
+   await alertEvent(env,'automatic_transition',payload.key,old?.status,payload.status,message,payload.source,true,{title:payload.label,reason:payload.reason,date:payload.asof,value:payload.value,key:payload.key});
  }
+ if(isChange||bootRisk||Number.isFinite(payload.value))await acFireCustomRules(env,{source:'automatic',key:payload.key,label:payload.label,oldStatus:old?.status||'unknown',newStatus:payload.status,value:payload.value,metrics:payload.metrics,asof:payload.asof,reason:payload.reason,sourceUrl:payload.source},alertEvent);
  return isChange||bootRisk;
 }
 async function fetchJson(url,extra={}){
@@ -138,7 +348,7 @@ async function checkFilings(env){
      const already=await cursorGet(env,key);if(already)continue;
      await cursorPut(env,key,'notified');
      const msg=`📄 COMPANY UPDATE DETECTED\n\nCompany: ${sym}\nDocument: SEC ${item.form}\nFiled: ${item.date||'date unavailable'}\n\nWHY this message: A new public filing was found. This is informational—NOT a negative or positive stock rating.\n\nWHAT TO DO: Open the filing, read what changed, then update your ${sym} Stock review if it affects your investment thesis.\n\nSource: ${item.url}`;
-     await alertEvent(env,'new_filing',key,null,'review',msg,item.url,true);changed++;
+     await alertEvent(env,'new_filing',key,null,'review',msg,item.url,true,{title:`${sym}: new SEC ${item.form}`,reason:`A new SEC ${item.form} filing was detected. It is not a risk rating.`,ticker:sym,date:item.date});changed++;
    }
    await recordCheck(env,{key:`sec:feed:${sym}`,scope:'filings',label:`${sym} SEC filing feed`,status:'review',asof:utcNow().slice(0,10),reason:`Latest SEC filing feed checked. ${entries.length} newly observed relevant forms. Filing significance requires reading the primary document.`,source:`https://www.sec.gov/edgar/browse/?CIK=${Number(cik)}`});
   }catch(e){errors.push(`SEC ${sym}: ${errText(e)}`);}
@@ -184,8 +394,9 @@ async function checkFinnhub(env){
  let checked=0,changed=0;const errors=[];if(!env.FINNHUB_API_KEY)return {checked,changed,errors:[]};
  for(const sym of ['QQQM','SMH','QQQ','NVDA','MSFT']){
   try{
-   const url=`https://finnhub.io/api/v1/quote?symbol=${encodeURIComponent(sym)}&token=${encodeURIComponent(env.FINNHUB_API_KEY)}`;
-   const q=await fetchJson(url);if(!(q.c>0)||!(q.pc>0))throw Error('No usable quote (free entitlement or symbol may be unsupported)');
+   // Finnhub supports X-Finnhub-Token; don't put this secret in the URL/query string.
+   const url=`https://finnhub.io/api/v1/quote?symbol=${encodeURIComponent(sym)}`;
+   const q=await fetchJson(url,{'X-Finnhub-Token':env.FINNHUB_API_KEY});if(!(q.c>0)||!(q.pc>0))throw Error('No usable quote (free entitlement or symbol may be unsupported)');
    const delta=(q.c/q.pc-1)*100;
    const asof=q.t?new Date(q.t*1000).toISOString().slice(0,10):null;
    const age=asof?(Date.now()-Date.parse(asof+'T00:00:00Z'))/86400e3:999;
@@ -199,6 +410,8 @@ async function checkFinnhub(env){
  return {checked,changed,errors};
 }
 async function sendCheckin(env,summary,mode){
+ const settings=env.__acSettings||await acGetSettings(env);
+ if(!acShouldNotify(settings,'digest'))return;
  if(mode==='off')return;
  if(mode==='changes' && summary.changed===0)return;
  if(mode==='daily'){
@@ -211,7 +424,7 @@ async function sendCheckin(env,summary,mode){
  const digestFlags=flags.slice(0,4).map(x=>`• ${x.label} — ${x.status==='serious'?'SERIOUS':'MODERATE'} (data ${x.asof||'undated'})\n  ${short(x.reason,170)}`);
  const readable=flags.length?`Items needing review (${flags.length} among fetched checks):\n${digestFlags.join('\n')}`:'No Watch/Serious flags in the fetched summary. This does NOT prove the whole market is safe.';
  const msg=`📋 RISK LAB — ${mode==='daily'?'DAILY CHECK-IN':'CHECK SUMMARY'}\n\nWHY this message: ${mode==='daily'?'Your scheduled daily summary is enabled. This is not necessarily a new warning.':'Your Worker completed a check with status changes.'}\n\nWHAT WAS CHECKED:\n• ${summary.checked} data checks completed\n• ${summary.changed} status changes detected\n• ${summary.errors.length} provider problems\n\n${readable}\n${summary.errors.length?'\nData access problems: '+summary.errors.slice(0,2).map(x=>short(x,130)).join('; '):''}\n\nHOW TO USE THIS: Open Risk Lab → Automated results to see dated evidence. "No warning" only applies to rules checked successfully. The system does not trade for you.\n\nRun time: ${utcNow()} UTC (observation dates may be earlier).`;
- try{await telegram(env,msg)}catch(e){console.error('check-in telegram failed',errText(e));}
+ try{await telegram(env,acApplyTemplate(settings.templates.digest,{title:'Scheduled summary',reason:msg,checked:summary.checked,changed:summary.changed,errors:summary.errors.length,date:utcNow().slice(0,10)}))}catch(e){console.error('check-in telegram failed',errText(e));}
 }
 async function runCheck(env,{includeMarkets=true,includeSec=false,includeAnnual=false,includeQuotes=true,checkin=true}={}){
  if(!env.DB)throw Error('D1 binding is required');
@@ -232,7 +445,7 @@ async function runCheck(env,{includeMarkets=true,includeSec=false,includeAnnual=
  else{await recordCheck(env,{key:'sys:provider',scope:'system',label:'Data provider health',status:'clear',asof:utcNow().slice(0,10),reason:'All configured checks completed without reported provider errors.'})}
  const summary={ranAt:start,finishedAt:utcNow(),checked,changed,errors};
  if(checkin){
-  const mode=env.CHECKIN_MODE||'daily';
+  const mode=(env.__acSettings||await acGetSettings(env)).digestMode;
   // Daily digest is sent with the market batch (typically after daily FRED publications),
   // not at the first hourly quote poll shortly after UTC midnight.
   if(mode!=='daily'||includeMarkets)await sendCheckin(env,summary,mode);
@@ -293,7 +506,8 @@ WHAT IT MEANS: ${scope==='checklist'?'This severity describes only this indicato
 Your evidence: ${note}
 
 NEXT: Review affected holdings if the new information is material. No trade is placed.`;
-    await alertEvent(env,'manual_checkbox',`${scope}:${key}`,prior,current,msg,null,true);
+    await alertEvent(env,'manual_checkbox',`${scope}:${key}`,prior,current,msg,null,true,{title:`${scope==='checklist'?'Market checklist':'Urgent event'} ${key}`,reason:note,date:now.slice(0,10)});
+    if(scope==='checklist')await acFireCustomRules(env,{source:'manual',key,oldStatus:prior,newStatus:current,reason:note,asof:now.slice(0,10)},alertEvent);
    }
   }
   // Stock-specific review statuses are stored under fields.stockReviews, so old D1 schema remains compatible.
@@ -318,7 +532,8 @@ WHY notified: You changed your severity rating for this stock. SEC cash-flow dat
 Your evidence: ${short(entry?.note||'No note provided.',480)}
 
 NEXT: Review ${sym} in Risk Lab → Stock reviews if this changes your thesis. The rating and ticker are saved to D1.`;
-      await alertEvent(env,'manual_stock_review',`stock:${sym}:${indicatorId}`,prior,nowStatus,msg,null,true);
+      await alertEvent(env,'manual_stock_review',`stock:${sym}:${indicatorId}`,prior,nowStatus,msg,null,true,{title:`${sym} ${indicatorId} review`,ticker:sym,reason:short(entry?.note||'No note provided',480),date:now.slice(0,10)});
+      await acFireCustomRules(env,{source:'manual',key:`stock:${sym}:${indicatorId}`,ticker:sym,oldStatus:prior,newStatus:nowStatus,reason:entry?.note||'',asof:now.slice(0,10)},alertEvent);
     }
   }
  }
@@ -350,7 +565,7 @@ async function setOverride(req,env){
  const msg=clear?
    `↩️ YOUR OVERRIDE WAS REMOVED\n\nCheck: ${check.label}\nYour prior setting: ${old?.status}\nVisible machine result again: ${check.status}\n\nWHY notified: You removed your manual override. This does not mean the market itself changed.\n\nOriginal data: ${short(check.reason,450)}\nObservation: ${check.asof||'unknown'}`:
    `✍️ YOU OVERRULED A MACHINE CHECK\n\nCheck: ${check.label}\nMachine said: ${check.status}\nYou chose: ${newStatus}\n\nWHY notified: You saved a personal interpretation. Future machine alerts continue normally.\n\nYour reason: ${short(note,550)}\nOriginal data note: ${short(check.reason,420)}\nObservation date: ${check.asof||'unknown'}\n\nWHAT TO DO: Nothing unless you want to reconsider the override in Automated results.`;
- await alertEvent(env,'manual_override',`override:${check.key}`,oldStatus,newStatus,msg,check.source_url,true);
+ await alertEvent(env,'manual_override',`override:${check.key}`,oldStatus,newStatus,msg,check.source_url,true,{title:`${check.label}: source override`,reason:clear?'Override removed':note,date:utcNow().slice(0,10)});
  return J({ok:true,effective_status:newStatus,automatic_status:check.status,override_status:clear?null:newStatus});
 }
 async function getUserState(env){const r=await env.DB.prepare('SELECT json,revision,updated_at FROM user_state WHERE id=1').first();return J({revision:r?.revision||0,updatedAt:r?.updated_at||null,state:r?JSON.parse(r.json):null});}
@@ -386,20 +601,30 @@ export default {
    if(!await authorised(req,env))return J({error:'Unauthorized. Enter your private DASHBOARD_TOKEN.'},401,originHeaders);
    const u=urlOf(req),path=u.pathname;
    let res;
-   if(path==='/api/ping'&&req.method==='GET')res=J({ok:true,version:'1.0',utc:utcNow(),storage:'Cloudflare D1'});
+   // Existing D1 cursors table stores settings + encrypted provider keys. No migrations.
+   if(path==='/api/alert-settings'&&req.method==='GET')res=J({settings:await acGetSettings(env),categories:AC_NAMES});
+   else if(path==='/api/alert-settings'&&req.method==='PUT')res=J({ok:true,settings:await acSaveSettings(env,await req.json())});
+   else if(path==='/api/credentials'&&req.method==='GET')res=J({fields:acKeyMeta(env,await acGetKeys(env)),dashboardToken:'Cloudflare secret, intentionally never revealable by Worker API'});
+   else if(path==='/api/credentials'&&req.method==='PUT')res=J({ok:true,fields:await acUpdateKeys(env,await req.json())});
+   else if(path==='/api/credentials/reveal'&&req.method==='POST'){
+     const input=await req.json().catch(()=>({}));
+     if(input.confirm!==true)res=J({error:'Confirm that you want to reveal keys in this browser session'},400);
+     else res=J({values:await acGetKeys(env)});
+   }
+   else if(path==='/api/ping'&&req.method==='GET')res=J({ok:true,version:'1.0',utc:utcNow(),storage:'Cloudflare D1'});
    else if(path==='/api/overview'&&req.method==='GET')res=await getOverview(env);
    else if(path==='/api/archive-page'&&req.method==='GET')res=await getArchivePage(env,u);
    else if(path==='/api/user-state'&&req.method==='GET')res=await getUserState(env);
-   else if(path==='/api/override'&&req.method==='POST')res=await setOverride(req,env);
-   else if(path==='/api/user-state'&&req.method==='PUT')res=await saveUserState(req,env);
+   else if(path==='/api/override'&&req.method==='POST')res=await setOverride(req,await acEffectiveEnv(env));
+   else if(path==='/api/user-state'&&req.method==='PUT')res=await saveUserState(req,await acEffectiveEnv(env));
    else if(path==='/api/check'&&req.method==='POST'){
      // Manual runs are throttled to prevent burning API budgets.
      const body=await req.json().catch(()=>({})); const scope=['market','sec','fundamentals'].includes(body.scope)?body.scope:'market';
      const last=await cursorGet(env,`last:manual-run:${scope}`);
      if(last&&Date.now()-Date.parse(last)<5*60*1000)res=J({error:'Manual checks limited to once every five minutes'},429);
-     else{await cursorPut(env,`last:manual-run:${scope}`,utcNow());res=J({ok:true,...await runCheck(env,{includeMarkets:scope==='market',includeSec:scope==='sec',includeAnnual:scope==='fundamentals',includeQuotes:scope==='market',checkin:true})});}
+     else{await cursorPut(env,`last:manual-run:${scope}`,utcNow());res=J({ok:true,...await runCheck(await acEffectiveEnv(env),{includeMarkets:scope==='market',includeSec:scope==='sec',includeAnnual:scope==='fundamentals',includeQuotes:scope==='market',checkin:true})});}
    }
-   else if(path==='/api/test-telegram'&&req.method==='POST')res=J({ok:true,...await telegram(env,`✅ RISK LAB — TELEGRAM CONNECTED\n\nWHY this message: You pressed Send Telegram test in your dashboard.\n\nWHAT TO EXPECT: Scheduled daily check-ins (if enabled), important automatic status changes, SEC filing notices, and your own checkbox / override changes.\n\nWHAT TO DO: Nothing. A future warning means REVIEW, not automatically buy or sell.\n\nTest time: ${utcNow()} UTC`)});
+   else if(path==='/api/test-telegram'&&req.method==='POST')res=J({ok:true,...await telegram(await acEffectiveEnv(env),`✅ RISK LAB — TELEGRAM CONNECTED\n\nWHY this message: You pressed Send Telegram test in your dashboard.\n\nWHAT TO EXPECT: Scheduled daily check-ins (if enabled), important automatic status changes, SEC filing notices, and your own checkbox / override changes.\n\nWHAT TO DO: Nothing. A future warning means REVIEW, not automatically buy or sell.\n\nTest time: ${utcNow()} UTC`)});
    else res=J({error:'Not found'},404);
    return new Response(res.body,{status:res.status,headers:{...Object.fromEntries(res.headers.entries()),...originHeaders}});
   }catch(e){console.error(errText(e));return J({error:errText(e)},500,originHeaders)}
@@ -411,6 +636,6 @@ export default {
    const annual=cron.startsWith('40 12 ');
    const filings=cron.startsWith('15 ') && hour%4===0;
    const quotes=cron.startsWith('15 ');
-   ctx.waitUntil(runCheck(env,{includeMarkets:market,includeSec:filings,includeAnnual:annual,includeQuotes:quotes,checkin:true}).catch(e=>console.error('scheduled check failed',errText(e))));
+   ctx.waitUntil(acEffectiveEnv(env).then(configured=>runCheck(configured,{includeMarkets:market,includeSec:filings,includeAnnual:annual,includeQuotes:quotes,checkin:true})).catch(e=>console.error('scheduled check failed',errText(e))));
  }
 };
